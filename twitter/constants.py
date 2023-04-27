@@ -379,6 +379,7 @@ trending_params = {
     "include_ext_trusted_friends_metadata": "true",
     "send_error_codes": "true",
     "simple_quoted_tweet": "true",
+    "tweet_search_mode": "live",
     "count": 1000,
     "requestContext": "launch",
     "include_page_configuration": "true",
