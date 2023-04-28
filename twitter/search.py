@@ -5,10 +5,15 @@ import platform
 import random
 import time
 from pathlib import Path
+from typing import Optional, Union
+from tenacity import retry, stop_after_attempt, wait_exponential, before_sleep, before_log
+
+from datetime import datetime
+import pytz
 
 import aiohttp
 import orjson
-from httpx import AsyncClient
+from httpx import Client
 
 from .constants import *
 from .login import login
@@ -23,91 +28,113 @@ if platform.system() != 'Windows':
 	import uvloop
 
 class Search:
-	def __init__(self, email: str, username: str, password: str):
-		self.session = login(email, username, password)
+	def __init__(self, login_session: login, search_config: dict):
 		self.api = 'https://api.twitter.com/2/search/adaptive.json?'
+		self.login_session = login_session
+		self.search_config = search_config
 
-	def run(self, *args, out: str = 'data', **kwargs):
-		out_path = self.make_output_dirs(out)
-		loop = uvloop.new_event_loop()
-		asyncio.set_event_loop(loop)
-		result = loop.run_until_complete(self.process(args, search_config, out_path, **kwargs))
-		loop.close()
-		return result
+	def run_batch(self, queries: Union[str, list[str]], limit: Optional[int] = None) -> list:
+		queries = [queries] if isinstance(queries, str) else queries
 
-	async def process(self, queries: tuple, config: dict, out: Path, **kwargs) -> list:
-		async with AsyncClient(headers=get_headers(self.session)) as s:
-			return await asyncio.gather(*(self.paginate(q, s, config, out, **kwargs) for q in queries))
+		with Client(headers=get_headers(self.login_session)) as login_session:
+			return [[tweet for tweet in self.paginate(query, login_session, limit)] for query in queries]
 
-	async def paginate(self, query: str, session: AsyncClient, config: dict, out: Path, **kwargs) -> list[
-		dict]:
-		config['q'] = query
-		r, data, next_cursor = await self.backoff(lambda: self.get(session, config), query)
-		if len(data['globalObjects']['tweets']) < 20:
-			next_cursor = None
-		all_data = [data]
-		c = colors.pop() if colors else ''
+	def run(self, query: str, limit: Optional[int] = None) -> list:
+		with Client(headers=get_headers(self.login_session)) as login_session:
+			for tweet in self.paginate(query, login_session, limit):
+				yield tweet
+
+	def paginate(self, query: str, session: Client, limit: Optional[int] = None) -> list[dict]:
+		next_cursor = True
 		ids = set()
-		while next_cursor:
-			ids |= set(data['globalObjects']['tweets'])
-			if len(ids) >= kwargs.get('limit', math.inf):
-				logger.debug(f'[{GREEN}success{RESET}] returned {len(ids)} search results for {c}{query}{reset}')
-				return all_data
-			logger.debug(f'{c}{query}{reset}')
-			config['cursor'] = next_cursor
+		all_data = []
 
-			r, data, next_cursor = await self.backoff(lambda: self.get(session, config), query)
-			data['query'] = query
-			(out / f'raw/{time.time_ns()}.json').write_text(
-				orjson.dumps(data, option=orjson.OPT_INDENT_2).decode(),
-				encoding='utf-8'
-			)
-			all_data.append(data)
+		search_config = self.search_config.copy()
+		search_config['q'] = query
+
+		while next_cursor:
+			if isinstance(next_cursor, str):
+				search_config['cursor'] = next_cursor
+			
+			r, data, next_cursor = self.get(session, search_config)
+
+			parsed_tweets = self.parse_page(data)
+			for tweet in parsed_tweets:
+				yield tweet
+
+			ids |= set(data['globalObjects']['tweets'])
+			if limit and len(ids) >= limit:
+				return all_data
 
 			if len(data['globalObjects']['tweets']) < 20:
 				next_cursor = None
 
 		return all_data
 
-	async def backoff(self, fn, info, retries=12):
-		for i in range(retries + 1):
-			try:
-				r, data, next_cursor = await fn()
-				if not data.get('globalObjects', {}).get('tweets'):
-					raise Exception
-				return r, data, next_cursor
-			except Exception as e:
-				if i == retries:
-					logger.debug(f'Max retries exceeded\n{e}')
-					return
-				t = 2 ** i + random.random()
-				logger.debug(f'No data for: \u001b[1m{info}\u001b[0m | retrying in {f"{t:.2f}"} seconds\t\t{e}')
-				time.sleep(t)
+	@staticmethod
+	def parse_page(data: dict) -> list[dict]:
 
-	async def get(self, session: AsyncClient, params: dict) -> tuple:
+		tweeters = {}
+		for tweeter_id_str in data['globalObjects']['users']:
+			tweeter = data['globalObjects']['users'][tweeter_id_str]
+
+			tweeters[tweeter_id_str] = {
+					'user_screen_name': tweeter['screen_name'],
+					'user_name': tweeter['name'],
+					'user_followers': tweeter['followers_count'],
+					'user_profile_image_url': tweeter['profile_image_url_https'].replace('_normal', '400x400'),
+				}
+
+		tweets = []
+		for tweet_id_str in data['globalObjects']['tweets']:
+			tweet = data['globalObjects']['tweets'][tweet_id_str]
+			
+			item = {
+					'id': tweet['id_str'],
+					'collection_time': datetime.now().isoformat(),
+					'impression_count': tweet['ext_views']['count'],
+					'like_count': tweet['favorite_count'],
+					'reply_count': tweet['reply_count'],
+					'reply_count': tweet['reply_count'],
+					'local_time': Search.parse_date(tweet['created_at']),
+					'text': tweet['full_text'],
+					'media': [{
+						'type': media['type'],
+						'url': media['media_url_https'],
+					} for media in tweet['entities']['media']] if 'media' in tweet['entities'] else None,
+					'to_tweetid': tweet.get('in_reply_to_status_id_str', None),
+					'quoted_id': tweet.get('quoted_status_id_str', None),
+				}
+			item.update(tweeters[tweet['user_id_str']])
+			tweets.append(item)
+		
+		return tweets
+
+	@staticmethod
+	def parse_date(utc_datetime_str: str) -> datetime:
+		utc_dt = datetime.strptime(utc_datetime_str, "%a %b %d %H:%M:%S +0000 %Y")
+		return utc_dt.strftime("%Y-%m-%d %H:%M:%S")
+
+	@retry(stop=stop_after_attempt(12), wait=wait_exponential(multiplier=1, min=1, max=60), before_sleep=before_log(logger, logging.DEBUG))
+	def get(self, session: Client, params: dict) -> tuple:
 		url = set_qs(self.api, params, update=True, safe='()')
-		r = await session.get(url)
+
+		r = session.get(url)
 		data = r.json()
 		next_cursor = self.get_cursor(data)
+
+		if not data.get('globalObjects', {}).get('tweets'):
+			raise Exception
+
 		return r, data, next_cursor
 
 	def get_cursor(self, res: dict):
-		try:
-			for instr in res['timeline']['instructions']:
-				if replaceEntry := instr.get('replaceEntry'):
-					cursor = replaceEntry['entry']['content']['operation']['cursor']
-					if cursor['cursorType'] == 'Bottom':
-						return cursor['value']
-					continue
-				for entry in instr['addEntries']['entries']:
-					if entry['entryId'] == 'sq-cursor-bottom':
-						return entry['content']['operation']['cursor']['value']
-		except Exception as e:
-			logger.debug(e)
-
-	def make_output_dirs(self, path: str) -> Path:
-		p = Path(f'~/{path}').expanduser()
-		(p / 'raw').mkdir(parents=True, exist_ok=True)
-		(p / 'processed').mkdir(parents=True, exist_ok=True)
-		(p / 'final').mkdir(parents=True, exist_ok=True)
-		return p
+		for instr in res['timeline']['instructions']:
+			if replaceEntry := instr.get('replaceEntry'):
+				cursor = replaceEntry['entry']['content']['operation']['cursor']
+				if cursor['cursorType'] == 'Bottom':
+					return cursor['value']
+				continue
+			for entry in instr['addEntries']['entries']:
+				if entry['entryId'] == 'sq-cursor-bottom':
+					return entry['content']['operation']['cursor']['value']
